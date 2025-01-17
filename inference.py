@@ -1,3 +1,6 @@
+import sys
+import logging
+import functools
 import numpy as np
 from hmm_utils import backward_algorithm, forward_algorithm, _nstep_log_trans_prob
 from scipy.special import logsumexp
@@ -7,6 +10,28 @@ import os
 from scipy.stats import chi2, norm, beta
 from numpy.random import normal
 from scipy.stats import multivariate_normal
+from pathos.multiprocessing import ProcessingPool
+
+def get_logger(logfile = None):
+    logger = logging.getLogger()
+    logger.setLevel(level=logging.INFO)
+
+    formatter = logging.Formatter('%(levelname)s %(asctime)s %(filename)s %(funcName)s[line:%(lineno)d] : %(message)s')
+
+    # write into file
+    if logfile is not None:
+        file_handler = logging.FileHandler(logfile, mode='w')
+        file_handler.setLevel(level=logging.INFO)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    # write to stdout
+    stream_handler = logging.StreamHandler(stream = sys.stdout)
+    stream_handler.setLevel(logging.INFO)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+    return logger
 
 def parse_args():
 	"""Define the Arguments"""
@@ -28,6 +53,7 @@ def parse_args():
 	parser.add_argument('--noAlleleTraj', default=False, action='store_true', help='whether to compute the posterior allele frequency trajectory or not.')
 	parser.add_argument('--integration_points', type=int, default = -1)
 	parser.add_argument('--h', type=float, default = 0.5)
+	parser.add_argument('--threads', type=int, help='Number of threads used to infer trajectory. Should be lower then 10 * (number of selection coefficients that are estimated)', default = 1)
 
 	return parser.parse_args()
 
@@ -289,10 +315,19 @@ def likelihood(theta, args):
 
 if __name__ == "__main__":
 	args = parse_args()
+
+	print("Received arguments:")
+	for key, value in vars(args).items():
+		print(f"    {key}: {value}")
+
+	logfile = f'{args.out}.log'
+	logger = get_logger(logfile)
+
 	if args.times == None and args.ancientSamps == None and args.ancientHaps == None:
-		print('You need to supply coalescence times (--times) and/or ancient samples (--ancientSamps)')
+		logger.error('You need to supply coalescence times (--times) and/or ancient samples (--ancientSamps)')
 	
 	# load data and set up model
+	logger.info('Loading data and set up model')
 	#should delete the previous verion
 	if os.path.exists(args.out+"_tempfile.txt"):
 		os.remove(args.out+"_tempfile.txt")
@@ -312,6 +347,7 @@ if __name__ == "__main__":
 	noCoals = int(noCoals)
 
 	# optimize over selection parameters
+	logger.info('Optimizing over selection parameters')
 	T = len(timeBins)
 	S0 = 0.0 * np.ones(T-1)
 	opts = {}
@@ -332,8 +368,7 @@ if __name__ == "__main__":
 
 	ImpSamp = False
 	if times.shape[2] > 1:
-		print('\t(Importance sampling with M = %d samples)'%(times.shape[2]))
-		print()
+		logger.info(f'Importance sampling with M = {times.shape[2]} samples')
 		ImpSamp = True
 	if not ImpSamp: # to account for whether we return the likelihood or the log likelihood
 
@@ -358,7 +393,7 @@ if __name__ == "__main__":
 					except ValueError:
 						pass
 			except ValueError:
-				print("Selection MLE not found in [-0.1,0.1], possibly due to noninformative data. Expanding search to [-1,1].")
+				logger.info("Selection MLE not found in [-0.1,0.1], possibly due to noninformative data. Expanding search to [-1,1].")
 				res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.00000001,1.0,2.0],args=minargs, method = "Brent", tol = 1e-4))
 				S = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
 				L = res.fun
@@ -372,6 +407,7 @@ if __name__ == "__main__":
 
 		Weights = []
 	else:
+		logger.info('Performing importance sampling')
 		M = times.shape[2]
 		Weights = np.zeros(M)
 		precompute = 0
@@ -386,6 +422,7 @@ if __name__ == "__main__":
 
 		if len(S0) == 1:
 			try:
+				logger.info('Running minimize_scalar')
 				res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.9,1.0,1.1],args=minargs, method = "Brent", tol = 1e-4))
 				S = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
 				L = res.fun
@@ -400,17 +437,19 @@ if __name__ == "__main__":
 					except ValueError:
 						pass
 			except ValueError:
-				print("Selection MLE not found in [-0.1,0.1], possibly due to noninformative data. Expanding search to [-1,1].")
+				logger.info("Selection MLE not found in [-0.1,0.1], possibly due to noninformative data. Expanding search to [-1,1].")
 				res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.00000001,1.0,2.0],args=minargs, method = "Brent", tol = 1e-4))
 				S = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
 				L = res.fun
 		else:
+			logger.info('Running minimize')
 			res = minimize(likelihood_wrapper, S0, args=minargs, options=opts, method='Nelder-Mead')
 			S = res.x
 			L = res.fun
 		numericloglik = -L
 		toprint = '%.4f'%(-L)
 
+	logger.info('Writing inference results')
 	FirstLine = "logLR" + "\t" + "-log10(p-value)"
 	epochnum = 1
 	degreesoffreedom = len(S)
@@ -429,8 +468,10 @@ if __name__ == "__main__":
 	f.writelines(FirstLine  + "\n" + toprint + "\n")
 	f.close()
 	functionvals.close()
+	logger.info(f'-- inference file is {args.out+"_inference.txt"}')
 
 	if not args.noAlleleTraj:
+		logger.info('Estimating allele trajectory')
 		file1 = open(args.out+"_tempfile.txt", 'r')
 		Lines = file1.readlines()
 		Xvals = []
@@ -476,7 +517,7 @@ if __name__ == "__main__":
 			res = res.x
 			for iggi in res:
 				if iggi > 0.2 or iggi < -0.2:
-					print("Poor fit of normal distribution to data. Unreliable results follow.")
+					logger.info("Poor fit of normal distribution to data. Unreliable results follow.")
 
 			#print("mu2: ", muu)
 			#print("sd2: ", res)
@@ -500,12 +541,39 @@ if __name__ == "__main__":
 			else:
 				variatess = multivariate_normal.rvs(mean=muu, cov=covarmat, size = args.integration_points)
 
-		# infer trajectory @ MLE of selection parameter
-		post = np.exp(traj_wrapper(variatess[0],timeBins,Ne,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,epochs,noCoals,currFreq,sMax,derSampledTimes,ancSampledTimes,Weights))
-		for v in range(1,len(variatess)):
-			post = post + np.exp(traj_wrapper(variatess[v],timeBins,Ne,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,epochs,noCoals,currFreq,sMax,derSampledTimes,ancSampledTimes,Weights))
+		## infer trajectory @ MLE of selection parameter
+		logger.info(f'Infering trajectory @ MLE of selection parameter using {args.threads} threads')
+		
+		# raw serial codes
+		# post = np.exp(traj_wrapper(variatess[0],timeBins,Ne,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,epochs,noCoals,currFreq,sMax,derSampledTimes,ancSampledTimes,Weights))
+		# for v in range(1,len(variatess)):
+		# 	post = post + np.exp(traj_wrapper(variatess[v],timeBins,Ne,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,epochs,noCoals,currFreq,sMax,derSampledTimes,ancSampledTimes,Weights))
+		# post = post / np.sum(post,axis=0)
+
+		# parallel run
+		traj_wrapper_partial = functools.partial(
+			traj_wrapper, timeBins=timeBins, N=Ne, h=h, freqs=freqs, times=times, logfreqs=logfreqs,
+			log1minusfreqs=log1minusfreqs, z_bins=z_bins, z_logcdf=z_logcdf, z_logsf=z_logsf, ancGLs=ancientGLs, 
+			ancHapGLs=ancientHapGLs, gens=epochs, noCoals=noCoals, currFreq=currFreq, sMax=sMax, 
+			derSampledTimes=derSampledTimes, ancSampledTimes=ancSampledTimes, Weights=Weights
+		)
+
+		pool = ProcessingPool(args.threads)
+		results = pool.map(traj_wrapper_partial, variatess)
+
+		post = np.exp(results[0])
+		for ii in range(1, len(results)):
+			post += np.exp(results[ii])
 		post = post / np.sum(post,axis=0)
-		np.savetxt(args.out+"_freqs.txt", freqs, delimiter=",")
-		np.savetxt(args.out+"_post.txt", post, delimiter=",")
+
+		out_freqs_file = f'{args.out}_freqs.txt'
+		out_post_file = f'{args.out}_post.txt'
+
+		np.savetxt(out_freqs_file, freqs, delimiter=",")
+		np.savetxt(out_post_file, post, delimiter=",")
+
+		logger.info(f'-- freq file is {out_freqs_file}')
+		logger.info(f'-- post file is {out_post_file}')
+
 	if os.path.exists(args.out+"_tempfile.txt"):
 		os.remove(args.out+"_tempfile.txt")
