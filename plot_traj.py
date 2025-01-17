@@ -8,10 +8,11 @@ import matplotlib.patches as mpatches
 parser = argparse.ArgumentParser()
 parser.add_argument('--freqs',type=str)
 parser.add_argument('--post',type=str)
-parser.add_argument('--figure',type=str)
+parser.add_argument('--out_prefix',type=str)
 parser.add_argument('--posterior_intervals', default=[0.5, 0.75, 0.95, 0.999], type=float, nargs='+',
                     help='The posterior thresholds for which to draw different consensus trees.')
 parser.add_argument('--generation_time', default=-1.0, type=float, help='Conversion to generation time.')
+parser.add_argument('--ext',type=str,default='pdf')
 args = parser.parse_args()
 ConfidenceIntervals = []
 ColorIntensity = []
@@ -20,7 +21,10 @@ for i in range(len(args.posterior_intervals)):
     ColorIntensity.append(1 - float(i)/len(args.posterior_intervals))
 ConfidenceIntervals.sort()
 
+print(f'Loading freqs from {args.freqs}')
 freqs =  np.loadtxt(args.freqs, delimiter=",", dtype=float)
+
+print(f'Loading post from {args.post}')
 logpost = np.loadtxt(args.post, delimiter=",", dtype=float)
 epochs = np.linspace(0,logpost.shape[1],logpost.shape[1] + 1)
 f,ax = plt.subplots(1,1)
@@ -60,6 +64,7 @@ for indexx in range(len(ConfidenceIntervals)):
             if j >= currentlow and j <= currenthigh:
                 MATRIXTOPLOT[j, int(timeinterval)] = np.max([MATRIXTOPLOT[j, int(timeinterval)], ColorIntensity[indexx]])
 
+print('Plotting allele frequency trajectory')
 if args.generation_time == -1.0:
     plt.pcolormesh(epochs[:-1],freqs, MATRIXTOPLOT, shading='auto')
     plt.axis((0,len(epochs[:-1]),0,1.0))
@@ -81,4 +86,6 @@ for i in range(len(ConfidenceIntervals)):
 
 ax.legend(handles=handless, loc='upper right')
 
-plt.savefig('%s.%s'%(args.figure,'png'),format='png', dpi=300, bbox_inches='tight')
+out_file = '%s.%s'%(args.out_prefix, args.ext)
+plt.savefig(out_file, format=args.ext, bbox_inches='tight')
+print(f'Done. Frequency trajectory is {out_file}')

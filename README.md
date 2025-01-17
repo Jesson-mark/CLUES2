@@ -1,10 +1,14 @@
 # CLUES2
 
-## NOTE
+## NOTE about this version
 
 This is a parallelized version of [CLUES2](https://github.com/avaughn271/CLUES2), which includes a new `threads` parameter to infer the trajectory in parallel.
 
-Following are the orginal descriptions from CLUES2.
+Other minor modifications:
+- Added a `--ext` argument to `plot_traj.py` script and replaced `--figure` with `--out_prefix`
+- Used `logging` module to print informative messages when running `inference.py`
+
+The following are the original descriptions from CLUES2.
 
 ## Purpose
 CLUES2 is a program to infer selection coefficients, evaluate the statistical evidence for selection, and reconstruct historic allele frequencies. It is currently maintained by [Andrew Vaughn](https://nielsen-lab.github.io/team/andrew-vaughn). Please report any strange results, errors, or code suggestions to him at [ahv36@berkeley.edu](mailto:ahv36@berkeley.edu). If you use this program, please cite: [Stern, *et al.* Plos Gen. (2019)](https://doi.org/10.1371/journal.pgen.1008384) and: [Vaughn and Nielsen (2024)](https://academic.oup.com/mbe/article/41/8/msae156/7724092).
