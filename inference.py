@@ -1,6 +1,7 @@
 import sys
 import logging
 import functools
+import time
 import numpy as np
 from hmm_utils import backward_algorithm, forward_algorithm, _nstep_log_trans_prob
 from scipy.special import logsumexp
@@ -54,6 +55,7 @@ def parse_args():
 	parser.add_argument('--integration_points', type=int, default = -1)
 	parser.add_argument('--h', type=float, default = 0.5)
 	parser.add_argument('--threads', type=int, help='Number of threads used to infer trajectory. Should be lower then 10 * (number of selection coefficients that are estimated)', default = 1)
+	parser.add_argument('--trajOnly', default=False, action='store_true', help='Skip selection MLE; reuse existing {out}_tempfile.txt and only infer the trajectory.')
 
 	return parser.parse_args()
 
@@ -247,21 +249,43 @@ def traj_wrapper(theta,timeBins,N,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z
 	else:
 		importanceSampling = True
 
+	# if importanceSampling:
+	# 	M = tShape[2]
+	# 	loglrs = np.zeros(M)
+	# 	postBySamples = np.zeros((F,T-1,M))
+	# 	tranmatrix = _nstep_log_trans_prob(N[0],sel[0],freqs,z_bins,z_logcdf,z_logsf,h) # this only handles the precompute case, just use initial values
+	# 	precompute = 0
+	# 	if len(np.unique(N)) + len(np.unique(sel)) == 2:
+	# 		precompute = 1
+	# 	for i in range(M):
+	# 		betaMat = backward_algorithm(sel,times[:,:,i],derSampledTimes,ancSampledTimes,epochs,N,h,freqs,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancGLs,ancHapGLs,tranmatrix,noCoals=noCoals,precomputematrixboolean=precompute,currFreq=currFreq)
+	# 		alphaMat = forward_algorithm(sel,times[:,:,i],derSampledTimes,ancSampledTimes,epochs,N,h,freqs,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancGLs,ancHapGLs,noCoals=noCoals)
+	# 		logl = logsumexp(betaMat[-2,:])
+	# 		loglrs[i] = logl - Weights[i]
+	# 		postBySamples[:,:,i] = (alphaMat[1:,:] + betaMat[:-1,:]).transpose()
+	# 		print(f"  trajectory importance sample {i}/{M}", flush=True)
+	# 	post = logsumexp(loglrs + postBySamples,axis=2)
+	# 	post -= logsumexp(post,axis=0)
+
+	# 用 streaming logsumexp 替掉 postBySamples以减少内存占用
 	if importanceSampling:
 		M = tShape[2]
-		loglrs = np.zeros(M)
-		postBySamples = np.zeros((F,T-1,M))
 		tranmatrix = _nstep_log_trans_prob(N[0],sel[0],freqs,z_bins,z_logcdf,z_logsf,h) # this only handles the precompute case, just use initial values
 		precompute = 0
 		if len(np.unique(N)) + len(np.unique(sel)) == 2:
 			precompute = 1
+		post = None
 		for i in range(M):
 			betaMat = backward_algorithm(sel,times[:,:,i],derSampledTimes,ancSampledTimes,epochs,N,h,freqs,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancGLs,ancHapGLs,tranmatrix,noCoals=noCoals,precomputematrixboolean=precompute,currFreq=currFreq)
 			alphaMat = forward_algorithm(sel,times[:,:,i],derSampledTimes,ancSampledTimes,epochs,N,h,freqs,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancGLs,ancHapGLs,noCoals=noCoals)
 			logl = logsumexp(betaMat[-2,:])
-			loglrs[i] = logl - Weights[i]
-			postBySamples[:,:,i] = (alphaMat[1:,:] + betaMat[:-1,:]).transpose()
-		post = logsumexp(loglrs + postBySamples,axis=2)
+			sample_post = (alphaMat[1:,:] + betaMat[:-1,:]).transpose() + (logl - Weights[i])
+			if post is None:
+				post = sample_post
+			else:
+				post = np.logaddexp(post, sample_post)
+			if i % 100 == 0:
+				print(f"  trajectory importance sample {i}/{M}", flush=True)
 		post -= logsumexp(post,axis=0)
 
 	else:
@@ -329,9 +353,17 @@ if __name__ == "__main__":
 	# load data and set up model
 	logger.info('Loading data and set up model')
 	#should delete the previous verion
-	if os.path.exists(args.out+"_tempfile.txt"):
-		os.remove(args.out+"_tempfile.txt")
-	functionvals = open(args.out+"_tempfile.txt", "a")
+
+	if not args.trajOnly:
+		if os.path.exists(args.out+"_tempfile.txt"):
+			os.remove(args.out+"_tempfile.txt")
+		functionvals = open(args.out+"_tempfile.txt", "a")
+	else:
+		if not os.path.exists(args.out+"_tempfile.txt"):
+			logger.error(f'--trajOnly requires an existing {args.out}_tempfile.txt from a prior run; none found.')
+			sys.exit(1)
+		functionvals = None
+
 	sMax = args.sMax
 	timeBins,times,epochs,Ne,freqs,ancientGLs,ancientHapGLs,noCoals,currFreq,logfreqs,log1minusfreqs,derSampledTimes,ancSampledTimes,h = load_data(args)
 	# read in global Phi(z) lookups
@@ -366,110 +398,213 @@ if __name__ == "__main__":
 	opts['maxfev'] = (T - 1) * 20
 	opts['initial_simplex']=Simplex
 
-	ImpSamp = False
-	if times.shape[2] > 1:
+	# ImpSamp = False
+	# if times.shape[2] > 1:
+	# 	logger.info(f'Importance sampling with M = {times.shape[2]} samples')
+	# 	ImpSamp = True
+	# if not ImpSamp: # to account for whether we return the likelihood or the log likelihood
+
+	# 	logL0 = likelihood_wrapper(S0,timeBins,Ne,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,epochs,noCoals,currFreq,sMax,derSampledTimes,ancSampledTimes,functionvals)
+
+	# 	minargs = (timeBins,Ne,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,epochs,noCoals,currFreq,sMax,derSampledTimes,ancSampledTimes,functionvals)
+
+	# 	if len(S0) == 1:
+	# 		try:
+	# 			res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.9,1.0,1.1],args=minargs, method = "Brent", tol = 1e-4))
+	# 			S = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
+	# 			L = res.fun
+
+	# 			if times.shape[1] < 31: # with small number of samples, result function can be multimodal, so do multiple optims and take best.
+	# 				try:
+	# 					res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [1.0001,1.00011,1.02],args=minargs, method = "Brent", tol = 1e-4))
+	# 					Stemp = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
+	# 					Ltemp = res.fun
+	# 					if Ltemp < L:
+	# 						S = Stemp
+	# 						L = Ltemp
+	# 				except ValueError:
+	# 					pass
+	# 		except ValueError:
+	# 			logger.info("Selection MLE not found in [-0.1,0.1], possibly due to noninformative data. Expanding search to [-1,1].")
+	# 			res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.00000001,1.0,2.0],args=minargs, method = "Brent", tol = 1e-4))
+	# 			S = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
+	# 			L = res.fun
+	# 	else:
+	# 		res = minimize(likelihood_wrapper, S0, args=minargs, options=opts, method='Nelder-Mead')
+	# 		S = res.x
+	# 		L = res.fun
+
+	# 	toprint = '%.4f'%(-L+logL0)
+	# 	numericloglik = -L+logL0
+
+	# 	Weights = []
+	# else:
+	# 	logger.info('Performing importance sampling')
+	# 	M = times.shape[2]
+	# 	Weights = np.zeros(M)
+	# 	precompute = 0
+	# 	tranmatrix = _nstep_log_trans_prob(Ne[0],0.0,freqs,z_bins,z_logcdf,z_logsf,h) # this only handles the precompute case, just use initial values
+	# 	if len(np.unique(Ne)) == 1:
+	# 		precompute = 1
+	# 	for i in range(M):
+	# 		betaMatl0 = backward_algorithm(np.zeros(len(Ne)),times[:,:,i],derSampledTimes,ancSampledTimes,epochs,Ne,h,freqs,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,tranmatrix,noCoals=noCoals,precomputematrixboolean=precompute,currFreq=currFreq)
+	# 		Weights[i] = logsumexp(betaMatl0[-2,:])
+
+	# 	minargs = (timeBins,Ne,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,epochs,noCoals,currFreq,sMax,derSampledTimes,ancSampledTimes,functionvals,Weights)
+
+	# 	if len(S0) == 1:
+	# 		try:
+	# 			logger.info('Running minimize_scalar')
+	# 			res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.9,1.0,1.1],args=minargs, method = "Brent", tol = 1e-4))
+	# 			S = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
+	# 			L = res.fun
+	# 			if times.shape[1] < 31: # with small number of samples, result function can be multimodal, so do multiple optims and take best.
+	# 				try:
+	# 					res = (minimize_scalar(likelihood_wrapper_scalar,  bracket = [1.0001,1.00011,1.02] ,args=minargs, method = "Brent", tol = 1e-4))
+	# 					Stemp = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
+	# 					Ltemp = res.fun
+	# 					if Ltemp < L:
+	# 						S = Stemp
+	# 						L = Ltemp
+	# 				except ValueError:
+	# 					pass
+	# 		except ValueError:
+	# 			logger.info("Selection MLE not found in [-0.1,0.1], possibly due to noninformative data. Expanding search to [-1,1].")
+	# 			res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.00000001,1.0,2.0],args=minargs, method = "Brent", tol = 1e-4))
+	# 			S = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
+	# 			L = res.fun
+	# 	else:
+	# 		logger.info('Running minimize')
+	# 		res = minimize(likelihood_wrapper, S0, args=minargs, options=opts, method='Nelder-Mead')
+	# 		S = res.x
+	# 		L = res.fun
+	# 	numericloglik = -L
+	# 	toprint = '%.4f'%(-L)
+
+	# logger.info('Writing inference results')
+	# FirstLine = "logLR" + "\t" + "-log10(p-value)"
+	# epochnum = 1
+	# degreesoffreedom = len(S)
+
+	# toprint = toprint + "\t" + '%.2f'%(-(chi2.logsf(numericloglik + numericloglik, degreesoffreedom ) ) / np.log(10) )
+	# for s,t,u in zip(S,timeBins[:-1],timeBins[1:]):
+	# 	toprint = toprint + "\t" + '%d'%(t)
+	# 	if u <= args.tCutoff:
+	# 		toprint = toprint + "\t" + '%d'%(u)
+	# 	else:
+	# 		toprint = toprint + "\t" + '%d'%(args.tCutoff)
+	# 	toprint = toprint + "\t" + '%.5f'%(s)
+	# 	FirstLine = FirstLine + "\t" + "Epoch" + str(epochnum) + "_start" + "\t" +  "Epoch" + str(epochnum)   + "_end"  + "\t" +  "SelectionMLE" + str(epochnum)
+	# 	epochnum = epochnum + 1
+	# f = open(args.out+"_inference.txt", "w+")
+	# f.writelines(FirstLine  + "\n" + toprint + "\n")
+	# f.close()
+	# functionvals.close()
+	# logger.info(f'-- inference file is {args.out+"_inference.txt"}')
+
+	ImpSamp = times.shape[2] > 1
+	if ImpSamp:
 		logger.info(f'Importance sampling with M = {times.shape[2]} samples')
-		ImpSamp = True
-	if not ImpSamp: # to account for whether we return the likelihood or the log likelihood
 
-		logL0 = likelihood_wrapper(S0,timeBins,Ne,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,epochs,noCoals,currFreq,sMax,derSampledTimes,ancSampledTimes,functionvals)
-
-		minargs = (timeBins,Ne,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,epochs,noCoals,currFreq,sMax,derSampledTimes,ancSampledTimes,functionvals)
-
-		if len(S0) == 1:
-			try:
-				res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.9,1.0,1.1],args=minargs, method = "Brent", tol = 1e-4))
-				S = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
-				L = res.fun
-
-				if times.shape[1] < 31: # with small number of samples, result function can be multimodal, so do multiple optims and take best.
-					try:
-						res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [1.0001,1.00011,1.02],args=minargs, method = "Brent", tol = 1e-4))
-						Stemp = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
-						Ltemp = res.fun
-						if Ltemp < L:
-							S = Stemp
-							L = Ltemp
-					except ValueError:
-						pass
-			except ValueError:
-				logger.info("Selection MLE not found in [-0.1,0.1], possibly due to noninformative data. Expanding search to [-1,1].")
-				res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.00000001,1.0,2.0],args=minargs, method = "Brent", tol = 1e-4))
-				S = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
-				L = res.fun
-		else:
-			res = minimize(likelihood_wrapper, S0, args=minargs, options=opts, method='Nelder-Mead')
-			S = res.x
-			L = res.fun
-
-		toprint = '%.4f'%(-L+logL0)
-		numericloglik = -L+logL0
-
-		Weights = []
-	else:
-		logger.info('Performing importance sampling')
+	# Weights 同时被 MLE 和 trajectory 用到,所以无论 trajOnly 与否都先算(~2 min)
+	if ImpSamp:
 		M = times.shape[2]
 		Weights = np.zeros(M)
 		precompute = 0
-		tranmatrix = _nstep_log_trans_prob(Ne[0],0.0,freqs,z_bins,z_logcdf,z_logsf,h) # this only handles the precompute case, just use initial values
+		tranmatrix = _nstep_log_trans_prob(Ne[0],0.0,freqs,z_bins,z_logcdf,z_logsf,h)
 		if len(np.unique(Ne)) == 1:
 			precompute = 1
 		for i in range(M):
 			betaMatl0 = backward_algorithm(np.zeros(len(Ne)),times[:,:,i],derSampledTimes,ancSampledTimes,epochs,Ne,h,freqs,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,tranmatrix,noCoals=noCoals,precomputematrixboolean=precompute,currFreq=currFreq)
 			Weights[i] = logsumexp(betaMatl0[-2,:])
+	else:
+		Weights = []
 
-		minargs = (timeBins,Ne,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,epochs,noCoals,currFreq,sMax,derSampledTimes,ancSampledTimes,functionvals,Weights)
-
-		if len(S0) == 1:
-			try:
-				logger.info('Running minimize_scalar')
-				res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.9,1.0,1.1],args=minargs, method = "Brent", tol = 1e-4))
-				S = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
+	if args.trajOnly:
+		logger.info('--trajOnly: skipping selection MLE, reusing existing _tempfile.txt')
+	else:
+		if not ImpSamp:
+			logL0 = likelihood_wrapper(S0,timeBins,Ne,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,epochs,noCoals,currFreq,sMax,derSampledTimes,ancSampledTimes,functionvals)
+			minargs = (timeBins,Ne,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,epochs,noCoals,currFreq,sMax,derSampledTimes,ancSampledTimes,functionvals)
+			if len(S0) == 1:
+				try:
+					res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.9,1.0,1.1],args=minargs, method = "Brent", tol = 1e-4))
+					S = [res.x - 1.0]
+					L = res.fun
+					if times.shape[1] < 31:
+						try:
+							res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [1.0001,1.00011,1.02],args=minargs, method = "Brent", tol = 1e-4))
+							Stemp = [res.x - 1.0]
+							Ltemp = res.fun
+							if Ltemp < L:
+								S = Stemp
+								L = Ltemp
+						except ValueError:
+							pass
+				except ValueError:
+					logger.info("Selection MLE not found in [-0.1,0.1], possibly due to noninformative data. Expanding search to [-1,1].")
+					res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.00000001,1.0,2.0],args=minargs, method = "Brent", tol = 1e-4))
+					S = [res.x - 1.0]
+					L = res.fun
+			else:
+				res = minimize(likelihood_wrapper, S0, args=minargs, options=opts, method='Nelder-Mead')
+				S = res.x
 				L = res.fun
-				if times.shape[1] < 31: # with small number of samples, result function can be multimodal, so do multiple optims and take best.
-					try:
-						res = (minimize_scalar(likelihood_wrapper_scalar,  bracket = [1.0001,1.00011,1.02] ,args=minargs, method = "Brent", tol = 1e-4))
-						Stemp = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
-						Ltemp = res.fun
-						if Ltemp < L:
-							S = Stemp
-							L = Ltemp
-					except ValueError:
-						pass
-			except ValueError:
-				logger.info("Selection MLE not found in [-0.1,0.1], possibly due to noninformative data. Expanding search to [-1,1].")
-				res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.00000001,1.0,2.0],args=minargs, method = "Brent", tol = 1e-4))
-				S = [res.x - 1.0] # adjusted wrapper to work on selection + 1, so that tolerance makes more sense.
+			toprint = '%.4f'%(-L+logL0)
+			numericloglik = -L+logL0
+		else:
+			logger.info('Performing importance sampling')
+			minargs = (timeBins,Ne,h,freqs,times,logfreqs,log1minusfreqs,z_bins,z_logcdf,z_logsf,ancientGLs,ancientHapGLs,epochs,noCoals,currFreq,sMax,derSampledTimes,ancSampledTimes,functionvals,Weights)
+			if len(S0) == 1:
+				try:
+					logger.info('Running minimize_scalar')
+					res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.9,1.0,1.1],args=minargs, method = "Brent", tol = 1e-4))
+					S = [res.x - 1.0]
+					L = res.fun
+					if times.shape[1] < 31:
+						try:
+							res = (minimize_scalar(likelihood_wrapper_scalar,  bracket = [1.0001,1.00011,1.02] ,args=minargs, method = "Brent", tol = 1e-4))
+							Stemp = [res.x - 1.0]
+							Ltemp = res.fun
+							if Ltemp < L:
+								S = Stemp
+								L = Ltemp
+						except ValueError:
+							pass
+				except ValueError:
+					logger.info("Selection MLE not found in [-0.1,0.1], possibly due to noninformative data. Expanding search to [-1,1].")
+					res = (minimize_scalar(likelihood_wrapper_scalar, bracket = [0.00000001,1.0,2.0],args=minargs, method = "Brent", tol = 1e-4))
+					S = [res.x - 1.0]
+					L = res.fun
+			else:
+				logger.info('Running minimize')
+				res = minimize(likelihood_wrapper, S0, args=minargs, options=opts, method='Nelder-Mead')
+				S = res.x
 				L = res.fun
-		else:
-			logger.info('Running minimize')
-			res = minimize(likelihood_wrapper, S0, args=minargs, options=opts, method='Nelder-Mead')
-			S = res.x
-			L = res.fun
-		numericloglik = -L
-		toprint = '%.4f'%(-L)
+			numericloglik = -L
+			toprint = '%.4f'%(-L)
 
-	logger.info('Writing inference results')
-	FirstLine = "logLR" + "\t" + "-log10(p-value)"
-	epochnum = 1
-	degreesoffreedom = len(S)
+		logger.info('Writing inference results')
+		FirstLine = "logLR" + "\t" + "-log10(p-value)"
+		epochnum = 1
+		degreesoffreedom = len(S)
+		toprint = toprint + "\t" + '%.2f'%(-(chi2.logsf(numericloglik + numericloglik, degreesoffreedom ) ) / np.log(10) )
+		for s,t,u in zip(S,timeBins[:-1],timeBins[1:]):
+			toprint = toprint + "\t" + '%d'%(t)
+			if u <= args.tCutoff:
+				toprint = toprint + "\t" + '%d'%(u)
+			else:
+				toprint = toprint + "\t" + '%d'%(args.tCutoff)
+			toprint = toprint + "\t" + '%.5f'%(s)
+			FirstLine = FirstLine + "\t" + "Epoch" + str(epochnum) + "_start" + "\t" +  "Epoch" + str(epochnum)   + "_end"  + "\t" +  "SelectionMLE" + str(epochnum)
+			epochnum = epochnum + 1
+		f = open(args.out+"_inference.txt", "w+")
+		f.writelines(FirstLine  + "\n" + toprint + "\n")
+		f.close()
+		functionvals.close()
+		logger.info(f'-- inference file is {args.out+"_inference.txt"}')
 
-	toprint = toprint + "\t" + '%.2f'%(-(chi2.logsf(numericloglik + numericloglik, degreesoffreedom ) ) / np.log(10) )
-	for s,t,u in zip(S,timeBins[:-1],timeBins[1:]):
-		toprint = toprint + "\t" + '%d'%(t)
-		if u <= args.tCutoff:
-			toprint = toprint + "\t" + '%d'%(u)
-		else:
-			toprint = toprint + "\t" + '%d'%(args.tCutoff)
-		toprint = toprint + "\t" + '%.5f'%(s)
-		FirstLine = FirstLine + "\t" + "Epoch" + str(epochnum) + "_start" + "\t" +  "Epoch" + str(epochnum)   + "_end"  + "\t" +  "SelectionMLE" + str(epochnum)
-		epochnum = epochnum + 1
-	f = open(args.out+"_inference.txt", "w+")
-	f.writelines(FirstLine  + "\n" + toprint + "\n")
-	f.close()
-	functionvals.close()
-	logger.info(f'-- inference file is {args.out+"_inference.txt"}')
-
+	# estimate allele frequency trajectory at MLE of selection parameter
 	if not args.noAlleleTraj:
 		logger.info('Estimating allele trajectory')
 		file1 = open(args.out+"_tempfile.txt", 'r')
@@ -558,8 +693,19 @@ if __name__ == "__main__":
 			derSampledTimes=derSampledTimes, ancSampledTimes=ancSampledTimes, Weights=Weights
 		)
 
-		pool = ProcessingPool(args.threads)
-		results = pool.map(traj_wrapper_partial, variatess)
+		if args.threads <= 1:
+			results = []
+			for vi, v in enumerate(variatess):
+				logger.info(f"Trajectory variate {vi+1}/{len(variatess)} start: theta={v}")
+				t0 = time.time()
+				results.append(traj_wrapper_partial(v))
+				logger.info(f"Trajectory variate {vi+1}/{len(variatess)} done in {time.time()-t0:.1f} sec")
+		else:
+			pool = ProcessingPool(args.threads)
+			results = pool.map(traj_wrapper_partial, variatess)
+			pool.close()
+			pool.join()
+			pool.clear()
 
 		post = np.exp(results[0])
 		for ii in range(1, len(results)):
@@ -575,5 +721,8 @@ if __name__ == "__main__":
 		logger.info(f'-- freq file is {out_freqs_file}')
 		logger.info(f'-- post file is {out_post_file}')
 
-	if os.path.exists(args.out+"_tempfile.txt"):
-		os.remove(args.out+"_tempfile.txt")
+	if not args.trajOnly and not args.noAlleleTraj:
+		if os.path.exists(args.out+"_tempfile.txt"):
+			os.remove(args.out+"_tempfile.txt")
+
+
