@@ -7,6 +7,7 @@ This is a parallelized version of [CLUES2](https://github.com/avaughn271/CLUES2)
 Other minor modifications:
 - Added a `--ext` argument to `plot_traj.py` script and replaced `--figure` with `--out_prefix`
 - Used `logging` module to print informative messages when running `inference.py`
+- Replaced the original `postBySamples` 3D array in trajectory inference with a streaming `logsumexp` implementation, reducing memory usage from `O(df × T × M)` to approximately `O(df × T)`
 
 The following are the original descriptions from CLUES2.
 
