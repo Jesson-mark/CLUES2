@@ -8,6 +8,7 @@ Other minor modifications:
 - Added a `--ext` argument to `plot_traj.py` script and replaced `--figure` with `--out_prefix`
 - Used `logging` module to print informative messages when running `inference.py`
 - Replaced the original `postBySamples` 3D array in trajectory inference with a streaming `logsumexp` implementation, reducing memory usage from `O(df × T × M)` to approximately `O(df × T)`
+- Added a `--trajOnly` option to rerun only the posterior allele frequency trajectory step by reusing an existing `{out}_tempfile.txt`, which is useful after a previous MLE run with `--noAlleleTraj` or after an interrupted trajectory run.
 
 The following are the original descriptions from CLUES2.
 
